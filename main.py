@@ -5,7 +5,7 @@ from metrics import LMAE
 import numpy as np
 import pandas as pd
 
-from sklearn.preprocessing import QuantileTransformer, OneHotEncoder
+from sklearn.preprocessing import QuantileTransformer, OneHotEncoder, StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
 from sklearn.impute import KNNImputer
 from sklearn.pipeline import Pipeline
@@ -19,7 +19,7 @@ from pytorch_tabnet.pretraining import TabNetPretrainer
 
 from xgboost import XGBRegressor
 
-from util import getMoreFeature, getCompoundFeature
+from util import loadFeature, getCompoundFeature
 
 def showShape(x_train, y_train, x_val, y_val, x_test):
     print("X train shape: ", x_train.shape)
@@ -31,8 +31,8 @@ def showShape(x_train, y_train, x_val, y_val, x_test):
 def getXGBParam():
     return {
           'tree_method' : 'gpu_hist', 
-          'learning_rate' : 0.01,
-          'n_estimators' : 50000,
+          'learning_rate' : 0.02,
+          'n_estimators' : 10000,
           'colsample_bytree' : 0.3,
           'subsample' : 0.75,
           'reg_alpha' : 19,
@@ -61,10 +61,10 @@ def getTabnetParam(args):
                    gamma = 1.3,
                    n_independent = 2,
                    n_steps = 3,
-                   lambda_sparse = 1e-5,
+                   lambda_sparse = 0,
                    optimizer_fn=torch.optim.Adam,
                    optimizer_params=dict(lr=1e-2, weight_decay = 1e-5),
-                   scheduler_params={"step_size":3, # how to use learning rate scheduler
+                   scheduler_params={"step_size":5, # how to use learning rate scheduler
                                      "gamma":0.9},
                    scheduler_fn=torch.optim.lr_scheduler.StepLR,
                    mask_type='entmax' # "sparsemax"
@@ -75,7 +75,7 @@ def trainXGB(train, test, args):
     checkpoint_path = os.path.join(args.root, args.checkpoint_path)
     
     x = train[features].to_numpy()
-    dummy_y = train['bins'].to_numpy()
+    dummy_y = train['surface_label'].to_numpy()
     y = train[target].to_numpy().reshape(-1, 1)
     x_test = test[features].to_numpy()
     print(x_test)
@@ -111,6 +111,7 @@ def trainXGB(train, test, args):
         train_pred[val_index, :] = model.predict(x_val).reshape(-1, 1)
         test_pred[:, i-1] = model.predict(x_test)
         print(test_pred[:, i-1])
+        print(model.feature_importances_)
         
         i+=1
         
@@ -170,6 +171,7 @@ def trainTabnet(train, test, args):
                 max_epochs=300 , patience=50,
                 batch_size=1024, virtual_batch_size=128,
                 from_unsupervised=unsupervised_model,
+                loss_fn = torch.nn.functional.l1_loss,
                 drop_last=False
             )
             
@@ -198,95 +200,71 @@ def execute(args):
     np.random.seed(args.seed)
     
     ###################################### Read dataset #########################################
-    train_path = os.path.join(args.root, args.train_path)
-    test_path = os.path.join(args.root, args.test_path)
-    
-    
-    train = pd.read_csv(train_path)
-    test = pd.read_csv(test_path)
-    
-    
-    train.pop('MOFname')
-    test.pop('MOFname')
-    print(train.info())
-    print(test.info())
-    
-    if args.boxParam: train, test = getMoreFeature(args, train, test, "box-param")
-    if args.coulomb: train, test = getMoreFeature(args, train, test, "coulomb-matrix")
+    train = pd.DataFrame()
+    test= pd.DataFrame()
+    if args.overview: 
+        train, test = loadFeature(args, train, test, "overview")
+        train.pop('MOFname')
+        test.pop('MOFname')
     
     ###################################### Feature Engineering #########################################
     global target, features
     target = 'CO2_working_capacity [mL/g]'
     
-    # print(test.columns)
+    #load additional features
+    if args.boxParam: train, test = loadFeature(args, train, test, "box-param")
+    if args.coulomb: train, test = loadFeature(args, train, test, "coulomb-matrix")
+    if args.metal: train, test = loadFeature(args, train, test, "metal-center")
+    
+    #load restored surface area, otherwise drop
+    if args.surface:
+        train, test = loadFeature(args, train, test, "gsa-restored")
+        # train.drop(train[train['surface_label'] == 1].index, inplace = True) #don't use gsa estimate in train
+        # train.pop('surface_label')
+        # test.pop('surface_label')
+    train.drop(train[train['surface_area [m^2/g]'] <= 0].index, inplace = True)
+    # train.drop(train[train['surface_area [m^2/g]'] == 0].index, inplace = True)
+    
+    #restore void fraction and void volume, then drop rows that cannot restored
+    train, test = getCompoundFeature(args, train, test, "void-volume")
+    train, test = getCompoundFeature(args, train, test, "void-fraction")
+    train.drop(train[train['void_fraction'] <= 0].index, inplace = True)
+    # train.drop(train[train['void_fraction'] == 0].index, inplace = True)
+    train.drop(train[train['void_volume [cm^3/g]'] <= 0].index, inplace = True)
     
     ###################################### Handle missing data #########################################
     
-    #drop 0, -1 surface area (temporary measure)
-    train.drop(train[train['surface_area [m^2/g]'] == -1].index, inplace = True)
-    train.drop(train[train['surface_area [m^2/g]'] == 0].index, inplace = True)
-    train.drop(train[train['void_fraction'] == -1].index, inplace = True)
-    train.drop(train[train['void_fraction'] == 0].index, inplace = True)
-    train.drop(train[train['void_volume [cm^3/g]'] == 0].index, inplace = True)
-    
-    # drop (permanent measure)
+    # drop (for now)
     train.drop(train[train['CO2/N2_selectivity'] == 0].index, inplace = True)
     train.drop(train[train['heat_adsorption_CO2_P0.15bar_T298K [kcal/mol]'] == np.inf].index, inplace = True)
     train.drop(train[train['heat_adsorption_CO2_P0.15bar_T298K [kcal/mol]'].isna()].index, inplace = True)
     
-    # problem_col = ['CO2/N2_selectivity', 'heat_adsorption_CO2_P0.15bar_T298K [kcal/mol]']
-    # train[problem_col].replace([-1, 0, np.inf, -np.inf], np.nan, inplace=True)
-    # test[problem_col].replace([-1, 0, np.inf, -np.inf], np.nan, inplace=True)
-    
     train, test = getCompoundFeature(args, train, test, "density")
-    if args.pseudo_target: train, test = getCompoundFeature(args, train, test, "pseudo-target")
     
+    #categorize columns
+    str_col = ["functional_groups", "topology", "crystal_sys"] if args.boxParam else ["functional_groups", "topology"]
+    transform_col = [col for col in train.columns if col not in [target, 'surface_label', 'void_label', 'metal_center'] + str_col]
     
-    str_col = ["functional_groups", "topology"]
-    if args.boxParam: str_col += ["crystal_sys"]
-    
-    not_required_transform = [target, "bins"] if args.pseudo_target else [target]
-    
-    print(not_required_transform)
-    transform_col = [col for col in train.columns if col not in not_required_transform + str_col]
-    
+    #process features that require transformation
     pipe = Pipeline([
-            # ('imputer', KNNImputer(n_neighbors=5)),
+            ('imputer', KNNImputer(n_neighbors=5)),
             ("scaler", QuantileTransformer(n_quantiles=256, output_distribution='normal')),
+            # ("scaler", MinMaxScaler()),
             # ("pca", PCA())
             ])
-    # print(transform_col)
     train[transform_col] = pipe.fit_transform(train[transform_col])
     test[transform_col] = pipe.transform(test[transform_col])
     
-    print("Numeric transform done")
+    #get more features which are either automatically transformed or do not require the process
+    if args.pseudo_target: train, test = getCompoundFeature(args, train, test, "pseudo-target")
+    if args.encoding != "null": train, test = getCompoundFeature(args, train, test, args.encoding, str_col = str_col)
     
-    if args.encoding == "ohe":
-        #one hot encodeing
-        enc = OneHotEncoder(drop = 'first')
-    
-        temp = enc.fit_transform(train[str_col])
-        train_ohe = pd.DataFrame(temp.toarray())
-        train = pd.concat([train.reset_index(drop=True), train_ohe], axis=1)
-        train = train.drop(str_col, axis=1)
-        
-        temp = enc.transform(test[str_col])
-        test_ohe = pd.DataFrame(temp.toarray())
-        test = pd.concat([test.reset_index(drop=True), test_ohe], axis=1)
-        test = test.drop(str_col, axis=1)
-        
-    elif args.encoding == "label":
-        for i in str_col:
-            train[i] = train[i].astype("category").cat.codes
-            test[i] = test[i].astype("category").cat.codes
-
-    print("String transform done")
     # ###################################### Train/Eval models #########################################
     
     
-    features = [col for col in train.columns if col not in not_required_transform]
+    features = [col for col in train.columns if col not in [target, "bins"]]
     
-    # print(test[features].info())
+    print(train[features].info())
     
     trainpred_path = os.path.join(args.root, args.trainpred_path)
     testpred_path = os.path.join(args.root, args.testpred_path)
